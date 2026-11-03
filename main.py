@@ -209,18 +209,33 @@ async def collect_and_notify(
     *,
     conversation_id: str,
     device_token: Optional[str],
-) -> Dict[str, Any]:
+    body_iter: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
     """Consume the rest of the upstream SSE stream, store the result, push.
 
     `accum` may already hold chunks parsed by the foreground pass-through
     before the handoff; we continue feeding it from where it left off.
+
+    `body_iter` is the SAME iterator the pass-through was pumping. An httpx
+    response may be iterated exactly once: a collector that called
+    aiter_bytes() itself raced the abandoned generator's finalizer and died
+    with StreamConsumed — the result store stayed empty while the app
+    polled a key that would never fill. Callers mid-relay hand the baton;
+    collect mode (nothing iterated yet) passes None.
     """
     try:
-        async for data in vllm_response.aiter_bytes():
+        source = body_iter if body_iter is not None else vllm_response.aiter_bytes()
+        async for data in source:
             accum.feed(data)
         accum.flush()
     except httpx.HTTPError as e:
         logger.error("Upstream stream error while collecting %s: %s", conversation_id, e)
+    except Exception:
+        # A half-drained stream must not masquerade as a finished answer —
+        # the app reads any stored completion as final. Fail open: the
+        # result endpoint keeps 404ing and the app's own lanes re-ask.
+        logger.exception("Collector for %s crashed; storing nothing", conversation_id)
+        return None
     finally:
         await vllm_response.aclose()
         await client.aclose()
@@ -241,6 +256,24 @@ async def collect_and_notify(
         data={"conversation_id": conversation_id, "result_id": completion.get("id")},
     )
     return completion
+
+
+# asyncio keeps only a weak reference to bare create_task results — a
+# collector can be garbage-collected mid-drain and the answer evaporates
+# without a trace. Hold the tasks until they finish.
+_collector_tasks: set = set()
+
+
+def _spawn_collector(client: httpx.AsyncClient, vllm_response: httpx.Response,
+                     accum: SSEAccumulator, body_iter: Any, conversation_id: str) -> None:
+    task = asyncio.create_task(collect_and_notify(
+        client, vllm_response, accum,
+        conversation_id=conversation_id,
+        device_token=registered_tokens.get(conversation_id),
+        body_iter=body_iter,
+    ))
+    _collector_tasks.add(task)
+    task.add_done_callback(_collector_tasks.discard)
 
 
 # --------------------------------------------------------------------------
@@ -284,6 +317,9 @@ async def chat_completions(request: Request):
             conversation_id=conversation_id,
             device_token=device_token,
         )
+        if completion is None:
+            return JSONResponse(status_code=502, content={
+                "error": {"message": "Failed to collect the completion", "type": "upstream_error"}})
         return JSONResponse(content=completion)
 
     # ---- Mode 1: pure SSE pass-through to the foreground app.
@@ -293,19 +329,25 @@ async def chat_completions(request: Request):
     async def passthrough():
         handed_off = False
         accum = SSEAccumulator()
+        # ONE iterator created here and pumped by hand: on handoff the very
+        # same object is handed to the collector, so the response is never
+        # iterated twice (httpx forbids it — the old second aiter_bytes()
+        # raced the abandoned generator's finalizer and died with
+        # StreamConsumed, silently losing the collected answer).
+        body_iter = vllm_response.aiter_bytes().__aiter__()
         try:
-            async for data in vllm_response.aiter_bytes():
+            while True:
+                try:
+                    data = await body_iter.__anext__()
+                except StopAsyncIteration:
+                    break
                 accum.feed(data)  # shadow-parse for a possible handoff
                 if await request.is_disconnected() or conversation_id in backgrounded:
                     # App backgrounded: keep draining vLLM server-side, push later.
                     # These bytes go to the collector instead of the dead client.
                     handed_off = True
                     logger.info("Handing off %s to background collector", conversation_id)
-                    asyncio.create_task(collect_and_notify(
-                        client, vllm_response, accum,
-                        conversation_id=conversation_id,
-                        device_token=registered_tokens.get(conversation_id),
-                    ))
+                    _spawn_collector(client, vllm_response, accum, body_iter, conversation_id)
                     return
                 yield data
         except asyncio.CancelledError:
@@ -313,11 +355,7 @@ async def chat_completions(request: Request):
             if not handed_off and conversation_id not in backgrounded:
                 handed_off = True
                 logger.info("Client disconnected mid-stream on %s; collecting server-side", conversation_id)
-                asyncio.create_task(collect_and_notify(
-                    client, vllm_response, accum,
-                    conversation_id=conversation_id,
-                    device_token=registered_tokens.get(conversation_id),
-                ))
+                _spawn_collector(client, vllm_response, accum, body_iter, conversation_id)
             raise
         finally:
             if not handed_off:
