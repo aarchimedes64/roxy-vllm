@@ -118,6 +118,45 @@ def _sse_data(line: str) -> Optional[str]:
     return data
 
 
+class SSEAccumulator:
+    """
+    Line-buffers RAW SSE bytes and parses 'data:' lines into chunk dicts.
+
+    Used by both the pass-through (to shadow what it forwards) and the
+    background collector, so a handoff that happens mid-line continues
+    parsing from exactly the right place. Both paths must consume the
+    response with aiter_bytes() — httpx forbids mixing iterator styles.
+    """
+
+    def __init__(self) -> None:
+        self._buf = b""
+        self.chunks: list = []
+
+    def _consume_line(self, raw: bytes) -> None:
+        data = _sse_data(raw.decode(errors="replace").strip())
+        if data is None:
+            return
+        try:
+            self.chunks.append(json.loads(data))
+        except json.JSONDecodeError:
+            logger.warning("Skipping malformed SSE chunk")
+
+    def feed(self, data: bytes) -> None:
+        self._buf += data
+        while True:
+            idx = self._buf.find(b"\n")
+            if idx < 0:
+                return
+            line, self._buf = self._buf[:idx], self._buf[idx + 1:]
+            self._consume_line(line)
+
+    def flush(self) -> None:
+        """Parse a trailing line that never got its newline (stream just ended)."""
+        if self._buf:
+            self._consume_line(self._buf)
+            self._buf = b""
+
+
 def assemble_completion(chunks: list) -> Dict[str, Any]:
     """
     Rebuild a standard chat.completion object from collected SSE chunks,
@@ -166,21 +205,20 @@ def assemble_completion(chunks: list) -> Dict[str, Any]:
 async def collect_and_notify(
     client: httpx.AsyncClient,
     vllm_response: httpx.Response,
+    accum: SSEAccumulator,
     *,
     conversation_id: str,
     device_token: Optional[str],
 ) -> Dict[str, Any]:
-    """Consume the rest of the upstream SSE stream, store the result, push."""
-    chunks: list = []
+    """Consume the rest of the upstream SSE stream, store the result, push.
+
+    `accum` may already hold chunks parsed by the foreground pass-through
+    before the handoff; we continue feeding it from where it left off.
+    """
     try:
-        async for line in vllm_response.aiter_lines():
-            data = _sse_data(line)
-            if data is None:
-                continue
-            try:
-                chunks.append(json.loads(data))
-            except json.JSONDecodeError:
-                logger.warning("Skipping malformed SSE chunk for %s", conversation_id)
+        async for data in vllm_response.aiter_bytes():
+            accum.feed(data)
+        accum.flush()
     except httpx.HTTPError as e:
         logger.error("Upstream stream error while collecting %s: %s", conversation_id, e)
     finally:
@@ -188,13 +226,13 @@ async def collect_and_notify(
         await client.aclose()
         backgrounded.discard(conversation_id)
 
-    completion = assemble_completion(chunks)
+    completion = assemble_completion(accum.chunks)
     full_text = completion["choices"][0]["message"]["content"]
 
     _prune_results()
     completed_results[conversation_id] = {"response": completion, "completed_at": time.time()}
     logger.info("Collected %d chunks (%d chars) for conversation %s",
-                len(chunks), len(full_text), conversation_id)
+                len(accum.chunks), len(full_text), conversation_id)
 
     await send_push(
         device_token or registered_tokens.get(conversation_id, ""),
@@ -242,36 +280,41 @@ async def chat_completions(request: Request):
     # ---- Mode 2: device_token present -> collect everything, push when done
     if device_token:
         completion = await collect_and_notify(
-            client, vllm_response,
+            client, vllm_response, SSEAccumulator(),
             conversation_id=conversation_id,
             device_token=device_token,
         )
         return JSONResponse(content=completion)
 
-    # ---- Mode 1: pure SSE pass-through to the foreground app
+    # ---- Mode 1: pure SSE pass-through to the foreground app.
+    # Bytes are forwarded VERBATIM (never re-framed: SSE blank lines are the
+    # event delimiters, and eating them breaks every standards-compliant
+    # client with "stream ended in the middle of an event").
     async def passthrough():
         handed_off = False
+        accum = SSEAccumulator()
         try:
-            async for raw_line in vllm_response.aiter_lines():
+            async for data in vllm_response.aiter_bytes():
+                accum.feed(data)  # shadow-parse for a possible handoff
                 if await request.is_disconnected() or conversation_id in backgrounded:
                     # App backgrounded: keep draining vLLM server-side, push later.
+                    # These bytes go to the collector instead of the dead client.
                     handed_off = True
                     logger.info("Handing off %s to background collector", conversation_id)
                     asyncio.create_task(collect_and_notify(
-                        client, vllm_response,
+                        client, vllm_response, accum,
                         conversation_id=conversation_id,
                         device_token=registered_tokens.get(conversation_id),
                     ))
                     return
-                if raw_line:
-                    yield f"{raw_line}\n"
+                yield data
         except asyncio.CancelledError:
             # Hard TCP disconnect (app killed / suspended without signaling)
             if not handed_off and conversation_id not in backgrounded:
                 handed_off = True
                 logger.info("Client disconnected mid-stream on %s; collecting server-side", conversation_id)
                 asyncio.create_task(collect_and_notify(
-                    client, vllm_response,
+                    client, vllm_response, accum,
                     conversation_id=conversation_id,
                     device_token=registered_tokens.get(conversation_id),
                 ))
